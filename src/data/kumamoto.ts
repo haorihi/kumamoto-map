@@ -16,6 +16,47 @@ export type RoadFeature = {
   congestion: Record<TimeBand, number>
 }
 
+export type PickupPoint = {
+  id: string
+  name: string
+  area: string
+  position: LatLng
+}
+
+export type Passenger = {
+  id: string
+  name: string
+  species: string
+  mood: string
+  avatar: string
+  request: string
+  thanks: string
+}
+
+export type RouteCandidate = {
+  id: string
+  name: string
+  style: string
+  featureIds: string[]
+  path: LatLng[]
+  minutes: Record<TimeBand, number>
+  fare: number
+  comfort: number
+  merit: string
+  demerit: string
+  learningPoint: string
+}
+
+export type RideScenario = {
+  id: string
+  passengerId: string
+  originId: string
+  destinationId: string
+  timeBand: TimeBand
+  prompt: string
+  candidates: RouteCandidate[]
+}
+
 export const timeBands: Array<{ id: TimeBand; label: string; time: string }> = [
   { id: 'morning', label: '朝', time: '7:00-9:30' },
   { id: 'midday', label: '昼', time: '11:00-14:00' },
@@ -125,8 +166,8 @@ export const kumamotoFeatures: RoadFeature[] = [
     aliases: ['熊本駅近くの橋'],
     color: '#0891b2',
     path: [
-      { lat: 32.7922, lng: 130.6964 },
-      { lat: 32.7909, lng: 130.7004 },
+      { lat: 32.78983, lng: 130.6924 },
+      { lat: 32.78974, lng: 130.694 },
     ],
     hint: '熊本駅から中心市街地へ向かう時に意識したい白川の橋。',
     taxiNote: '駅発着の説明で「白川を渡る」感覚を作る入口になります。',
@@ -184,3 +225,254 @@ export const kumamotoFeatures: RoadFeature[] = [
 ]
 
 export const center = { lat: 32.7959, lng: 130.7156 }
+
+export const pickupPoints: PickupPoint[] = [
+  { id: 'kumamoto-station', name: '熊本駅白川口', area: '熊本駅', position: { lat: 32.7904, lng: 130.6899 } },
+  { id: 'karashima', name: '辛島町電停', area: '中心部南側', position: { lat: 32.7981, lng: 130.7055 } },
+  { id: 'torichosuji', name: '通町筋', area: '中心市街地', position: { lat: 32.8031, lng: 130.7106 } },
+  { id: 'suizenji', name: '水前寺公園前', area: '水前寺', position: { lat: 32.7909, lng: 130.7335 } },
+  { id: 'kumamoto-castle', name: '熊本城・市役所前', area: '熊本城周辺', position: { lat: 32.8038, lng: 130.7077 } },
+  { id: 'honjo', name: '本荘交差点', area: '本荘', position: { lat: 32.7937, lng: 130.7144 } },
+  { id: 'kengun', name: '健軍町電停', area: '健軍', position: { lat: 32.7787, lng: 130.7616 } },
+  { id: 'heisei', name: '平成駅前', area: '平成', position: { lat: 32.7816, lng: 130.7044 } },
+]
+
+export const passengers: Passenger[] = [
+  {
+    id: 'puku',
+    name: 'ぷくモチ',
+    species: 'まるい水辺の精',
+    mood: '急ぎだが、揺れに弱い',
+    avatar: 'ぷ',
+    request: '白川の近くを通るなら、橋の名前も教えてほしいぷく。',
+    thanks: '橋の名前、ちゃんと覚えたぷく。次もこの道でお願いしたいぷく。',
+  },
+  {
+    id: 'nibi',
+    name: 'ニビまる',
+    species: '夜道を光る小さな客',
+    mood: '混雑を避けたい',
+    avatar: 'に',
+    request: '時間は少しかかっても、詰まりにくい道がいいな。',
+    thanks: '流れが読める運転だった。通りの名前も頭に残ったよ。',
+  },
+  {
+    id: 'moko',
+    name: 'モコリ',
+    species: '雲みたいな旅好き',
+    mood: '景色重視',
+    avatar: 'も',
+    request: '川を渡る瞬間が好き。どの橋を通るか楽しみにしてる。',
+    thanks: '橋を渡る感じ、よかった。地図の向きも少しわかったよ。',
+  },
+  {
+    id: 'ruri',
+    name: 'ルリッカ',
+    species: '青い羽の案内好き',
+    mood: '早く着きたい',
+    avatar: 'る',
+    request: 'できるだけ早く。でも、なぜその道なのかも聞きたい。',
+    thanks: '理由があるルート選びだったね。通りの名前も納得できた。',
+  },
+]
+
+export const rideScenarios: RideScenario[] = [
+  {
+    id: 'station-to-toricho',
+    passengerId: 'puku',
+    originId: 'kumamoto-station',
+    destinationId: 'torichosuji',
+    timeBand: 'morning',
+    prompt: '熊本駅から中心市街地へ。白川をどう渡るかを判断する依頼。',
+    candidates: [
+      {
+        id: 'station-shirakawa-tram',
+        name: '白川橋から電車通り',
+        style: '基本を覚える',
+        featureIds: ['shirakawa-bridge', 'tram'],
+        path: [
+          { lat: 32.7904, lng: 130.6899 },
+          { lat: 32.78983, lng: 130.6924 },
+          { lat: 32.78974, lng: 130.694 },
+          { lat: 32.7952, lng: 130.7025 },
+          { lat: 32.8031, lng: 130.7106 },
+        ],
+        minutes: { morning: 16, midday: 13, evening: 17, night: 11 },
+        fare: 1680,
+        comfort: 82,
+        merit: '熊本駅から白川橋を渡る感覚が定着しやすい。',
+        demerit: '朝夕は駅前と橋詰めで待ちが出やすい。',
+        learningPoint: '熊本駅発で「白川橋を渡って中心部へ入る」基準線を作る。',
+      },
+      {
+        id: 'station-tahei-castle',
+        name: '泰平橋から城下町側',
+        style: '北側回り',
+        featureIds: ['tahei-bridge', 'route3'],
+        path: [
+          { lat: 32.7904, lng: 130.6899 },
+          { lat: 32.7944, lng: 130.6928 },
+          { lat: 32.7974, lng: 130.6968 },
+          { lat: 32.8002, lng: 130.7031 },
+          { lat: 32.8031, lng: 130.7106 },
+        ],
+        minutes: { morning: 18, midday: 14, evening: 18, night: 12 },
+        fare: 1760,
+        comfort: 76,
+        merit: '駅北側から中心部へ入る別ルートを覚えられる。',
+        demerit: '国道3号側の流れに引っ張られやすい。',
+        learningPoint: '泰平橋は熊本駅北側から中心部へ入る橋として覚える。',
+      },
+      {
+        id: 'station-chouroku-south',
+        name: '長六橋から南側進入',
+        style: '南側確認',
+        featureIds: ['chouroku-bridge'],
+        path: [
+          { lat: 32.7904, lng: 130.6899 },
+          { lat: 32.792, lng: 130.6985 },
+          { lat: 32.7938, lng: 130.7139 },
+          { lat: 32.7981, lng: 130.708 },
+          { lat: 32.8031, lng: 130.7106 },
+        ],
+        minutes: { morning: 20, midday: 15, evening: 19, night: 13 },
+        fare: 1840,
+        comfort: 70,
+        merit: '辛島町・河原町側から入る方向感を学べる。',
+        demerit: '目的地に対してやや回り込みになる。',
+        learningPoint: '長六橋は中心部南側へ入る橋として整理する。',
+      },
+    ],
+  },
+  {
+    id: 'karashima-to-suizenji',
+    passengerId: 'ruri',
+    originId: 'karashima',
+    destinationId: 'suizenji',
+    timeBand: 'evening',
+    prompt: '繁華街南側から水前寺方面へ。夕方の混雑をどう読むか。',
+    candidates: [
+      {
+        id: 'karashima-daiko-tram',
+        name: '大甲橋から電車通り',
+        style: '中心軸',
+        featureIds: ['daiko-bridge', 'tram'],
+        path: [
+          { lat: 32.7981, lng: 130.7055 },
+          { lat: 32.8012, lng: 130.7179 },
+          { lat: 32.7978, lng: 130.7201 },
+          { lat: 32.7948, lng: 130.7304 },
+          { lat: 32.7909, lng: 130.7335 },
+        ],
+        minutes: { morning: 15, midday: 13, evening: 19, night: 12 },
+        fare: 1580,
+        comfort: 78,
+        merit: '電車通りの東西感を覚えやすい。',
+        demerit: '夕方は市電・バス・歩行者で速度が落ちる。',
+        learningPoint: '大甲橋から水前寺方面へ抜ける流れを覚える。',
+      },
+      {
+        id: 'karashima-chouroku-honjo',
+        name: '長六橋から本荘側',
+        style: '南側回避',
+        featureIds: ['chouroku-bridge'],
+        path: [
+          { lat: 32.7981, lng: 130.7055 },
+          { lat: 32.7966, lng: 130.7111 },
+          { lat: 32.7938, lng: 130.7139 },
+          { lat: 32.7918, lng: 130.724 },
+          { lat: 32.7909, lng: 130.7335 },
+        ],
+        minutes: { morning: 17, midday: 14, evening: 17, night: 12 },
+        fare: 1660,
+        comfort: 84,
+        merit: '電車通りの混雑を少し避ける考え方を学べる。',
+        demerit: '細かい道の方向感が必要。',
+        learningPoint: '長六橋は南側から水前寺方面へ回す選択肢になる。',
+      },
+      {
+        id: 'karashima-sangyo-east',
+        name: '産業道路寄せ',
+        style: '東側へ逃がす',
+        featureIds: ['sangyo'],
+        path: [
+          { lat: 32.7981, lng: 130.7055 },
+          { lat: 32.8006, lng: 130.718 },
+          { lat: 32.8046, lng: 130.7399 },
+          { lat: 32.7975, lng: 130.7518 },
+          { lat: 32.7909, lng: 130.7335 },
+        ],
+        minutes: { morning: 19, midday: 15, evening: 20, night: 13 },
+        fare: 1880,
+        comfort: 68,
+        merit: '産業道路の斜め軸を地図上で把握できる。',
+        demerit: '水前寺に対しては遠回りで夕方のリスクもある。',
+        learningPoint: '産業道路は東側の斜め軸。目的地次第で使い分ける。',
+      },
+    ],
+  },
+  {
+    id: 'suizenji-to-kengun',
+    passengerId: 'nibi',
+    originId: 'suizenji',
+    destinationId: 'kengun',
+    timeBand: 'night',
+    prompt: '水前寺から健軍へ。夜の見通しがよい道を選ぶ依頼。',
+    candidates: [
+      {
+        id: 'suizenji-tram-kengun',
+        name: '電車通りまっすぐ',
+        style: 'わかりやすい',
+        featureIds: ['tram'],
+        path: [
+          { lat: 32.7909, lng: 130.7335 },
+          { lat: 32.7914, lng: 130.7401 },
+          { lat: 32.7885, lng: 130.751 },
+          { lat: 32.7787, lng: 130.7616 },
+        ],
+        minutes: { morning: 18, midday: 15, evening: 20, night: 12 },
+        fare: 1720,
+        comfort: 88,
+        merit: '市電沿いで説明しやすく、夜は位置感を失いにくい。',
+        demerit: '夕方は停車・乗降で遅くなりやすい。',
+        learningPoint: '電車通りは水前寺から健軍へ続く東西の基本線。',
+      },
+      {
+        id: 'suizenji-higashi-bypass',
+        name: '東バイパス寄せ',
+        style: '広い道',
+        featureIds: ['higashi-bypass'],
+        path: [
+          { lat: 32.7909, lng: 130.7335 },
+          { lat: 32.796, lng: 130.766 },
+          { lat: 32.781, lng: 130.763 },
+          { lat: 32.7787, lng: 130.7616 },
+        ],
+        minutes: { morning: 20, midday: 16, evening: 21, night: 13 },
+        fare: 1880,
+        comfort: 82,
+        merit: '東バイパスの南北軸を確認できる。',
+        demerit: '目的地によっては大きく回る。',
+        learningPoint: '東バイパスは健軍周辺へ広く回す時の基準になる。',
+      },
+      {
+        id: 'suizenji-sangyo-kengun',
+        name: '産業道路から健軍',
+        style: '混雑読み',
+        featureIds: ['sangyo'],
+        path: [
+          { lat: 32.7909, lng: 130.7335 },
+          { lat: 32.7975, lng: 130.7518 },
+          { lat: 32.7896, lng: 130.7635 },
+          { lat: 32.7787, lng: 130.7616 },
+        ],
+        minutes: { morning: 19, midday: 15, evening: 19, night: 12 },
+        fare: 1800,
+        comfort: 78,
+        merit: '産業道路と健軍方面の接続感を覚えられる。',
+        demerit: '時間帯によって右折や合流の詰まりが出る。',
+        learningPoint: '産業道路は東区方面の送迎で頻出の判断材料。',
+      },
+    ],
+  },
+]
