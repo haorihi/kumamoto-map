@@ -1,22 +1,22 @@
 import {
-  BadgeCheck,
   CarFront,
   CheckCircle2,
   Clock3,
-  Coins,
+  ListChecks,
   Map,
   Navigation,
+  Radio,
   RefreshCw,
   Route,
   Sparkles,
-  Star,
   Timer,
   TriangleAlert,
 } from 'lucide-react'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import './App.css'
 import { GoogleMapPanel } from './components/GoogleMapPanel'
 import {
+  type CompletedRide,
   kumamotoFeatures,
   passengers,
   pickupPoints,
@@ -25,6 +25,8 @@ import {
   type RideScenario,
   type RouteCandidate,
 } from './data/kumamoto'
+
+type RideState = 'selecting' | 'driving' | 'completed' | 'transitioning'
 
 function findScenario(index: number): RideScenario {
   return rideScenarios[index % rideScenarios.length]
@@ -52,14 +54,20 @@ function riskLabel(value: number) {
   return '低'
 }
 
+function statusLabel(state: RideState) {
+  if (state === 'driving') return '走行中'
+  if (state === 'completed') return '完了記録'
+  if (state === 'transitioning') return '次の依頼へ'
+  return '配車待機'
+}
+
 function App() {
+  const timersRef = useRef<number[]>([])
+  const rideCounterRef = useRef(0)
   const [scenarioIndex, setScenarioIndex] = useState(0)
   const [selectedRouteId, setSelectedRouteId] = useState(findScenario(0).candidates[0].id)
-  const [farePoints, setFarePoints] = useState(0)
-  const [satisfaction, setSatisfaction] = useState(86)
-  const [streak, setStreak] = useState(0)
-  const [completedRouteId, setCompletedRouteId] = useState<string | null>(null)
-  const [learnedLogs, setLearnedLogs] = useState<string[]>([])
+  const [rideState, setRideState] = useState<RideState>('selecting')
+  const [completedRides, setCompletedRides] = useState<CompletedRide[]>([])
 
   const scenario = findScenario(scenarioIndex)
   const passenger = passengers.find((item) => item.id === scenario.passengerId)!
@@ -76,46 +84,79 @@ function App() {
 
   const bestRoute = rankedRoutes[0]
   const selectedRisk = routeRisk(selectedRoute, scenario.timeBand)
-  const completed = completedRouteId === selectedRoute.id
+  const visitedFeatureIds = Array.from(new Set(completedRides.flatMap((ride) => ride.featureIds)))
+  const latestRide = completedRides[0]
 
   const selectRoute = (route: RouteCandidate) => {
+    if (rideState !== 'selecting') return
     setSelectedRouteId(route.id)
-    setCompletedRouteId(null)
   }
 
-  const completeRide = () => {
-    const isBest = selectedRoute.id === bestRoute.id
-    const points = selectedRoute.fare + (isBest ? 240 : 80) + Math.max(0, 90 - selectedRisk)
-    setFarePoints((value) => value + points)
-    setSatisfaction((value) => Math.min(100, Math.max(35, value + (isBest ? 4 : -2) + Math.round((selectedRoute.comfort - 76) / 8))))
-    setStreak((value) => (isBest ? value + 1 : 0))
-    setCompletedRouteId(selectedRoute.id)
-    setLearnedLogs((logs) => [
-      `${selectedRoute.name}: ${selectedRoute.learningPoint}`,
-      ...logs.filter((log) => !log.startsWith(`${selectedRoute.name}:`)),
-    ].slice(0, 5))
+  const clearRideTimers = () => {
+    timersRef.current.forEach((timer) => window.clearTimeout(timer))
+    timersRef.current = []
   }
 
-  const nextRide = () => {
-    const nextIndex = scenarioIndex + 1
+  const loadScenario = (nextIndex: number) => {
     const nextScenario = findScenario(nextIndex)
     setScenarioIndex(nextIndex)
     setSelectedRouteId(nextScenario.candidates[0].id)
-    setCompletedRouteId(null)
+    setRideState('selecting')
   }
 
+  const completeRide = () => {
+    if (rideState !== 'selecting') return
+
+    clearRideTimers()
+
+    rideCounterRef.current += 1
+
+    const completedRide: CompletedRide = {
+      id: `${scenario.id}-${selectedRoute.id}-${rideCounterRef.current}`,
+      scenarioId: scenario.id,
+      passengerName: passenger.name,
+      origin,
+      destination,
+      route: selectedRoute,
+      featureIds: selectedRoute.featureIds,
+      timeBand: scenario.timeBand,
+      completedAtLabel: `${timeBand.label} ${origin.name} → ${destination.name}`,
+    }
+
+    setRideState('driving')
+    timersRef.current = [
+      window.setTimeout(() => {
+        setCompletedRides((rides) => [completedRide, ...rides].slice(0, 10))
+        setRideState('completed')
+      }, 2800),
+      window.setTimeout(() => {
+        setRideState('transitioning')
+      }, 4600),
+      window.setTimeout(() => {
+        loadScenario(scenarioIndex + 1)
+      }, 5500),
+    ]
+  }
+
+  const nextRide = () => {
+    clearRideTimers()
+    loadScenario(scenarioIndex + 1)
+  }
+
+  useEffect(() => () => clearRideTimers(), [])
+
   return (
-    <main className="app-shell">
+    <main className={`app-shell ride-state-${rideState}`}>
       <section className="topbar">
         <div className="brand-lockup">
-          <p className="eyebrow"><CarFront size={16} /> Kumamoto Night Cab</p>
+          <p className="eyebrow"><Radio size={16} /> Kumamoto Night Cab</p>
           <h1>橋と通りで送迎を組み立てる</h1>
-          <p className="topbar-copy">ルートを選び、送迎しながら熊本市内の地名を覚えます。</p>
+          <p className="topbar-copy">今日の走行を光跡として残し、橋と通りの記憶に変えます。</p>
         </div>
-        <div className="scoreboard" aria-label="ゲームスコア">
-          <span><Coins size={18} /> {farePoints.toLocaleString()} pt</span>
-          <span><Star size={18} /> {satisfaction}%</span>
-          <span><BadgeCheck size={18} /> {streak} chain</span>
+        <div className="scoreboard dispatch-stats" aria-label="本日の送迎ステータス">
+          <span><CarFront size={18} /> {completedRides.length} rides</span>
+          <span><ListChecks size={18} /> {visitedFeatureIds.length} spots</span>
+          <span><Radio size={18} /> {statusLabel(rideState)}</span>
         </div>
       </section>
 
@@ -128,6 +169,8 @@ function App() {
           destination={destination}
           timeBand={scenario.timeBand}
           trafficEnabled={false}
+          rideState={rideState}
+          completedRides={completedRides}
         />
 
         <aside className="control-panel">
@@ -177,6 +220,7 @@ function App() {
                     type="button"
                     className={active ? 'route-option active' : 'route-option'}
                     onClick={() => selectRoute(route)}
+                    disabled={rideState !== 'selecting'}
                   >
                     <div>
                       <strong>{route.name}</strong>
@@ -197,7 +241,7 @@ function App() {
             </div>
             <div className="route-stats">
               <div><span>所要</span><strong>{selectedRoute.minutes[scenario.timeBand]}分</strong></div>
-              <div><span>運賃</span><strong>{selectedRoute.fare.toLocaleString()} pt</strong></div>
+              <div><span>通過</span><strong>{selectedRoute.featureIds.length}箇所</strong></div>
               <div><span>快適</span><strong>{selectedRoute.comfort}%</strong></div>
               <div><span>混雑</span><strong>{selectedRisk}%</strong></div>
             </div>
@@ -210,17 +254,18 @@ function App() {
               <p>{selectedRoute.learningPoint}</p>
             </div>
             <div className="action-row">
-              <button type="button" className="primary-action" onClick={completeRide}>
-                <CarFront size={18} /> このルートで送迎
+              <button type="button" className="primary-action" onClick={completeRide} disabled={rideState !== 'selecting'}>
+                <CarFront size={18} /> {rideState === 'selecting' ? 'このルートで送迎' : statusLabel(rideState)}
               </button>
-              <button type="button" className="ghost-action" onClick={nextRide} aria-label="次の依頼">
+              <button type="button" className="ghost-action" onClick={nextRide} aria-label="次の依頼" disabled={rideState === 'driving'}>
                 <RefreshCw size={18} />
               </button>
             </div>
-            {completed && (
+            {(rideState === 'completed' || rideState === 'transitioning') && (
               <div className="ride-result">
-                <strong>{selectedRoute.id === bestRoute.id ? '最適判断' : '送迎完了'}</strong>
+                <strong>{selectedRoute.id === bestRoute.id ? '最適判断で送迎完了' : '送迎完了'}</strong>
                 <p>「{passenger.thanks}」</p>
+                <small>{selectedRoute.name} / {featureNames(selectedRoute)}</small>
               </div>
             )}
           </section>
@@ -238,8 +283,12 @@ function App() {
         <article>
           <Sparkles size={19} />
           <div>
-            <h2>学習ログ</h2>
-            <p>{learnedLogs[0] ?? '送迎を完了すると、覚えた橋・通りのログがここに残ります。'}</p>
+            <h2>今日の走行ログ</h2>
+            {latestRide ? (
+              <p>{latestRide.completedAtLabel}: {featureNames(latestRide.route)} を通過。</p>
+            ) : (
+              <p>送迎を完了すると、通った橋・通りがここに時系列で残ります。</p>
+            )}
           </div>
         </article>
       </section>

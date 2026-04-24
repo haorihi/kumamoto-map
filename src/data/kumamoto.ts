@@ -57,6 +57,18 @@ export type RideScenario = {
   candidates: RouteCandidate[]
 }
 
+export type CompletedRide = {
+  id: string
+  scenarioId: string
+  passengerName: string
+  origin: PickupPoint
+  destination: PickupPoint
+  route: RouteCandidate
+  featureIds: string[]
+  timeBand: TimeBand
+  completedAtLabel: string
+}
+
 export const timeBands: Array<{ id: TimeBand; label: string; time: string }> = [
   { id: 'morning', label: '朝', time: '7:00-9:30' },
   { id: 'midday', label: '昼', time: '11:00-14:00' },
