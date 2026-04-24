@@ -1,277 +1,334 @@
 import {
   BrainCircuit,
   CarFront,
-  CheckCircle2,
   Clock3,
   EyeOff,
   ListChecks,
   Map,
+  MapPin,
   Navigation,
   Radio,
   RefreshCw,
   Route,
-  Timer,
   TriangleAlert,
 } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import './App.css'
 import { GoogleMapPanel } from './components/GoogleMapPanel'
+import { kumamotoFeatures, type LatLng } from './data/kumamoto'
 import {
-  type CompletedLesson,
-  kumamotoFeatures,
-  learningScenarios,
-  pickupPoints,
-  timeBands,
-  type LearningScenario,
-  type RouteCandidate,
-} from './data/kumamoto'
+  fetchRouteSession,
+  formatPoint,
+  type DynamicRouteCandidate,
+  type RouteFeatureHit,
+  type RouteSession,
+} from './lib/routing'
 
-type LessonState = 'selecting' | 'recalling' | 'reviewing' | 'transitioning'
+type LessonState = 'selecting' | 'recalling' | 'reviewing'
+type RouteRequestState = 'idle' | 'loading' | 'ready' | 'error'
+type PointSelectionState = 'origin' | 'destination' | 'ready'
 
-function findScenario(index: number): LearningScenario {
-  return learningScenarios[index % learningScenarios.length]
+type CompletedDynamicLesson = {
+  id: string
+  origin: LatLng
+  destination: LatLng
+  selectedRoute: DynamicRouteCandidate
+  quizFeatureSequence: RouteFeatureHit[]
+  recalledLabels: string[]
+  missedLabels: string[]
+  completedAtLabel: string
 }
 
-function featureName(id: string) {
-  return kumamotoFeatures.find((feature) => feature.id === id)?.name ?? id
-}
-
-function featureNamesFromIds(featureIds: string[]) {
-  return featureIds.map(featureName).join(' / ')
-}
-
-function featureNames(route: RouteCandidate) {
-  return featureNamesFromIds(route.featureIds)
-}
-
-function routeRisk(route: RouteCandidate, timeBand: LearningScenario['timeBand']) {
-  const features = route.featureIds
-    .map((id) => kumamotoFeatures.find((feature) => feature.id === id))
-    .filter((feature) => feature !== undefined)
-
-  if (!features.length) return 50
-  return Math.round(features.reduce((sum, feature) => sum + feature.congestion[timeBand], 0) / features.length)
-}
-
-function riskLabel(value: number) {
-  if (value >= 80) return '高'
-  if (value >= 65) return '中'
-  return '低'
-}
-
-function statusLabel(state: LessonState) {
-  if (state === 'recalling') return '記憶チェック'
-  if (state === 'reviewing') return '結果確認'
-  if (state === 'transitioning') return '次の課題へ'
-  return 'ルート選択'
+function statusLabel(routeRequestState: RouteRequestState, lessonState: LessonState) {
+  if (routeRequestState === 'loading') return 'ルート計算中'
+  if (routeRequestState === 'error') return '再指定が必要'
+  if (lessonState === 'recalling') return '記憶チェック'
+  if (lessonState === 'reviewing') return '結果確認'
+  return '地点指定'
 }
 
 function sequenceEqual(left: string[], right: string[]) {
   return left.length === right.length && left.every((value, index) => value === right[index])
 }
 
-function isLessonPerfect(lesson: CompletedLesson) {
-  return lesson.missedFeatureIds.length === 0 && sequenceEqual(lesson.featureIds, lesson.recalledFeatureIds)
+function routeLabels(route: DynamicRouteCandidate | undefined) {
+  return route?.quizFeatureSequence.map((hit) => hit.label) ?? []
 }
 
-function weakFeatureIds(lesson: CompletedLesson) {
+function isLessonPerfect(lesson: CompletedDynamicLesson) {
+  const answerLabels = lesson.quizFeatureSequence.map((hit) => hit.label)
+  return lesson.missedLabels.length === 0 && sequenceEqual(answerLabels, lesson.recalledLabels)
+}
+
+function weakLabels(lesson: CompletedDynamicLesson) {
   if (isLessonPerfect(lesson)) return []
-  return lesson.missedFeatureIds.length ? lesson.missedFeatureIds : lesson.featureIds
+  return lesson.missedLabels.length ? lesson.missedLabels : lesson.quizFeatureSequence.map((hit) => hit.label)
+}
+
+function distanceLabel(distanceMeters: number) {
+  if (distanceMeters >= 1000) return `${(distanceMeters / 1000).toFixed(1)}km`
+  return `${distanceMeters}m`
+}
+
+function uniqueLabels(hits: RouteFeatureHit[]) {
+  return Array.from(new Set(hits.map((hit) => hit.label)))
+}
+
+function pointInstruction(pointSelectionState: PointSelectionState) {
+  if (pointSelectionState === 'origin') return '地図をクリックして出発点を置く'
+  if (pointSelectionState === 'destination') return '地図をクリックして到着点を置く'
+  return '候補ルートから覚える道順を選ぶ'
+}
+
+function routeMetaLabel(routeRequestState: RouteRequestState, pointSelectionState: PointSelectionState, candidateCount: number) {
+  if (routeRequestState === 'loading') return 'routing'
+  if (routeRequestState === 'error') return 'error'
+  if (routeRequestState === 'ready') return `${candidateCount} candidates`
+  return pointSelectionState
+}
+
+function goalInstruction(routeRequestState: RouteRequestState, pointSelectionState: PointSelectionState) {
+  if (routeRequestState === 'loading') return '候補ルートを計算中'
+  if (routeRequestState === 'error') return '地点を指定し直す'
+  return pointInstruction(pointSelectionState)
 }
 
 function App() {
-  const timersRef = useRef<number[]>([])
   const lessonCounterRef = useRef(0)
-  const [scenarioIndex, setScenarioIndex] = useState(0)
-  const [selectedRouteId, setSelectedRouteId] = useState(findScenario(0).candidates[0].id)
+  const routeAbortRef = useRef<AbortController | null>(null)
+  const [origin, setOrigin] = useState<LatLng | null>(null)
+  const [destination, setDestination] = useState<LatLng | null>(null)
+  const [routeSession, setRouteSession] = useState<RouteSession | null>(null)
+  const [selectedRouteId, setSelectedRouteId] = useState<string | null>(null)
+  const [routeRequestState, setRouteRequestState] = useState<RouteRequestState>('idle')
+  const [routeError, setRouteError] = useState('')
   const [lessonState, setLessonState] = useState<LessonState>('selecting')
-  const [completedLessons, setCompletedLessons] = useState<CompletedLesson[]>([])
-  const [recalledFeatureIds, setRecalledFeatureIds] = useState<string[]>([])
+  const [completedLessons, setCompletedLessons] = useState<CompletedDynamicLesson[]>([])
+  const [recalledLabels, setRecalledLabels] = useState<string[]>([])
 
-  const scenario = findScenario(scenarioIndex)
-  const origin = pickupPoints.find((point) => point.id === scenario.originId)!
-  const destination = pickupPoints.find((point) => point.id === scenario.destinationId)!
-  const selectedRoute = scenario.candidates.find((route) => route.id === selectedRouteId) ?? scenario.candidates[0]
-  const timeBand = timeBands.find((band) => band.id === scenario.timeBand)!
+  const selectedRoute = routeSession?.candidates.find((route) => route.id === selectedRouteId) ?? routeSession?.candidates[0]
   const latestLesson = completedLessons[0]
-
-  const rankedRoutes = [...scenario.candidates].sort((a, b) => {
-    const aScore = a.minutes[scenario.timeBand] + routeRisk(a, scenario.timeBand) * 0.12 - a.comfort * 0.04
-    const bScore = b.minutes[scenario.timeBand] + routeRisk(b, scenario.timeBand) * 0.12 - b.comfort * 0.04
-    return aScore - bScore
-  })
-
-  const bestRoute = rankedRoutes[0]
-  const selectedRisk = routeRisk(selectedRoute, scenario.timeBand)
-  const recallOptionIds = Array.from(new Set(scenario.candidates.flatMap((route) => route.featureIds)))
-  const masteredFeatureIds = Array.from(new Set(completedLessons.filter(isLessonPerfect).flatMap((lesson) => lesson.featureIds)))
-  const reviewFeatureIds = Array.from(new Set(completedLessons.flatMap(weakFeatureIds)))
-  const selectedRouteIsBest = selectedRoute.id === bestRoute.id
+  const answerLabels = routeLabels(selectedRoute)
+  const recallOptionLabels = useMemo(
+    () => uniqueLabels(routeSession?.candidates.flatMap((route) => route.quizFeatureSequence) ?? []),
+    [routeSession],
+  )
+  const masteredLabels = Array.from(new Set(completedLessons.filter(isLessonPerfect).flatMap((lesson) => lesson.quizFeatureSequence.map((hit) => hit.label))))
+  const reviewLabels = Array.from(new Set(completedLessons.flatMap(weakLabels)))
   const latestPerfect = latestLesson ? isLessonPerfect(latestLesson) : false
   const latestOrderWrong = latestLesson
-    ? latestLesson.missedFeatureIds.length === 0 && !sequenceEqual(latestLesson.featureIds, latestLesson.recalledFeatureIds)
+    ? latestLesson.missedLabels.length === 0 && !sequenceEqual(latestLesson.quizFeatureSequence.map((hit) => hit.label), latestLesson.recalledLabels)
     : false
+  const pointSelectionState: PointSelectionState = !origin ? 'origin' : !destination ? 'destination' : 'ready'
 
-  const selectRoute = (route: RouteCandidate) => {
+  const requestRoutes = (nextOrigin: LatLng, nextDestination: LatLng) => {
+    routeAbortRef.current?.abort()
+    const abortController = new AbortController()
+    routeAbortRef.current = abortController
+    setRouteRequestState('loading')
+    setRouteError('')
+    setRouteSession(null)
+    setSelectedRouteId(null)
+    setLessonState('selecting')
+    setRecalledLabels([])
+
+    fetchRouteSession(nextOrigin, nextDestination, kumamotoFeatures, abortController.signal)
+      .then((session) => {
+        setRouteSession(session)
+        setSelectedRouteId(session.selectedRouteId)
+        setRouteRequestState('ready')
+      })
+      .catch((error: unknown) => {
+        if (abortController.signal.aborted) return
+        setRouteRequestState('error')
+        setRouteError(error instanceof Error ? error.message : 'ルート計算に失敗しました。')
+      })
+  }
+
+  const handleMapClick = (point: LatLng) => {
+    if (lessonState !== 'selecting') return
+
+    if (!origin || (origin && destination)) {
+      setOrigin(point)
+      setDestination(null)
+      setRouteSession(null)
+      setSelectedRouteId(null)
+      setRouteRequestState('idle')
+      setRouteError('')
+      setRecalledLabels([])
+      return
+    }
+
+    setDestination(point)
+    requestRoutes(origin, point)
+  }
+
+  const resetRoute = () => {
+    routeAbortRef.current?.abort()
+    setOrigin(null)
+    setDestination(null)
+    setRouteSession(null)
+    setSelectedRouteId(null)
+    setRouteRequestState('idle')
+    setRouteError('')
+    setLessonState('selecting')
+    setRecalledLabels([])
+  }
+
+  const selectRoute = (route: DynamicRouteCandidate) => {
     if (lessonState !== 'selecting') return
     setSelectedRouteId(route.id)
-  }
-
-  const clearTimers = () => {
-    timersRef.current.forEach((timer) => window.clearTimeout(timer))
-    timersRef.current = []
-  }
-
-  const loadScenario = (nextIndex: number) => {
-    const nextScenario = findScenario(nextIndex)
-    setScenarioIndex(nextIndex)
-    setSelectedRouteId(nextScenario.candidates[0].id)
-    setRecalledFeatureIds([])
-    setLessonState('selecting')
+    setRecalledLabels([])
   }
 
   const startLesson = () => {
-    if (lessonState !== 'selecting') return
-
-    clearTimers()
-    setRecalledFeatureIds([])
+    if (!selectedRoute || lessonState !== 'selecting') return
+    setRecalledLabels([])
     setLessonState('recalling')
   }
 
-  const selectRecallFeature = (featureId: string) => {
-    if (lessonState !== 'recalling' || recalledFeatureIds.includes(featureId)) return
-    setRecalledFeatureIds((current) => [...current, featureId])
+  const selectRecallLabel = (label: string) => {
+    if (lessonState !== 'recalling' || recalledLabels.includes(label)) return
+    setRecalledLabels((current) => [...current, label])
   }
 
-  const removeRecallFeature = (index: number) => {
+  const removeRecallLabel = (index: number) => {
     if (lessonState !== 'recalling') return
-    setRecalledFeatureIds((current) => current.filter((_, itemIndex) => itemIndex !== index))
+    setRecalledLabels((current) => current.filter((_, itemIndex) => itemIndex !== index))
   }
 
   const resetRecall = () => {
     if (lessonState !== 'recalling') return
-    setRecalledFeatureIds([])
-  }
-
-  const scheduleNextScenario = () => {
-    clearTimers()
-    timersRef.current = [
-      window.setTimeout(() => {
-        setLessonState('transitioning')
-      }, 2600),
-      window.setTimeout(() => {
-        loadScenario(scenarioIndex + 1)
-      }, 3500),
-    ]
+    setRecalledLabels([])
   }
 
   const submitRecall = () => {
-    if (lessonState !== 'recalling') return
+    if (!origin || !destination || !selectedRoute || lessonState !== 'recalling') return
 
     lessonCounterRef.current += 1
-
-    const missedFeatureIds = selectedRoute.featureIds.filter((id) => !recalledFeatureIds.includes(id))
-    const completedLesson: CompletedLesson = {
-      id: `${scenario.id}-${selectedRoute.id}-${lessonCounterRef.current}`,
-      scenarioId: scenario.id,
+    const missedLabels = answerLabels.filter((label) => !recalledLabels.includes(label))
+    const completedLesson: CompletedDynamicLesson = {
+      id: `${selectedRoute.id}-${lessonCounterRef.current}`,
       origin,
       destination,
       selectedRoute,
-      featureIds: selectedRoute.featureIds,
-      recalledFeatureIds,
-      missedFeatureIds,
-      timeBand: scenario.timeBand,
-      completedAtLabel: `${timeBand.label} ${origin.name} → ${destination.name}`,
+      quizFeatureSequence: selectedRoute.quizFeatureSequence,
+      recalledLabels,
+      missedLabels,
+      completedAtLabel: `${formatPoint(origin)} → ${formatPoint(destination)}`,
     }
 
     setCompletedLessons((lessons) => [completedLesson, ...lessons].slice(0, 12))
     setLessonState('reviewing')
-    scheduleNextScenario()
   }
 
-  const nextLesson = () => {
-    clearTimers()
-    setLessonState('transitioning')
-    timersRef.current = [
-      window.setTimeout(() => {
-        loadScenario(scenarioIndex + 1)
-      }, 450),
-    ]
+  const backToRoutes = () => {
+    setLessonState('selecting')
+    setRecalledLabels([])
   }
-
-  useEffect(() => () => clearTimers(), [])
 
   return (
     <main className={`app-shell lesson-state-${lessonState}`}>
       <section className="topbar">
         <div className="brand-lockup">
           <p className="eyebrow"><Radio size={16} /> Kumamoto Taxi Trainer</p>
-          <h1>橋・通りを覚える</h1>
-          <p className="topbar-copy">見る、選ぶ、思い出す。熊本市内の道を記憶に残すための練習画面です。</p>
+          <h1>任意地点で道順を覚える</h1>
+          <p className="topbar-copy">地図上で出発点と到着点を指定し、実道路ルートから通過する道路名・橋名を確認します。</p>
         </div>
         <div className="scoreboard dispatch-stats" aria-label="本日の学習ステータス">
           <span><CarFront size={18} /> 課題 {completedLessons.length}</span>
-          <span><ListChecks size={18} /> 定着 {masteredFeatureIds.length}</span>
-          <span><TriangleAlert size={18} /> 復習 {reviewFeatureIds.length}</span>
-          <span><Radio size={18} /> {statusLabel(lessonState)}</span>
+          <span><ListChecks size={18} /> 定着 {masteredLabels.length}</span>
+          <span><TriangleAlert size={18} /> 復習 {reviewLabels.length}</span>
+          <span><Radio size={18} /> {statusLabel(routeRequestState, lessonState)}</span>
         </div>
       </section>
 
       <section className="workspace">
         <GoogleMapPanel
           features={kumamotoFeatures}
-          routeCandidates={scenario.candidates}
-          selectedRoute={selectedRoute}
           origin={origin}
           destination={destination}
-          timeBand={scenario.timeBand}
-          trafficEnabled={false}
+          candidates={routeSession?.candidates ?? []}
+          selectedRoute={selectedRoute}
           lessonState={lessonState}
+          routeRequestState={routeRequestState}
           completedLessons={completedLessons}
+          onMapClick={handleMapClick}
         />
 
         <aside className="control-panel">
           <div className="lesson-goal-card">
-            <div className="lesson-goal-icon" aria-hidden="true"><BrainCircuit size={25} /></div>
+            <div className="lesson-goal-icon" aria-hidden="true"><MapPin size={25} /></div>
             <div>
-              <span className="panel-kicker">今回の学習目標</span>
-              <strong>{origin.name} → {destination.name}</strong>
-              <p>{scenario.learningGoal}</p>
+              <span className="panel-kicker">地点指定</span>
+              <strong>{goalInstruction(routeRequestState, pointSelectionState)}</strong>
+              <p>対象は熊本都市圏・近郊です。出発点と到着点がそろうとOSRMで候補ルートを計算します。</p>
             </div>
           </div>
 
           <section className="mission-card">
             <div className="mission-meta">
-              <span><Timer size={15} /> {timeBand.label} {timeBand.time}</span>
-              <span><Navigation size={15} /> Lesson {scenarioIndex + 1}</span>
+              <span><Navigation size={15} /> Dynamic route</span>
+              <span><MapPin size={15} /> {routeMetaLabel(routeRequestState, pointSelectionState, routeSession?.candidates.length ?? 0)}</span>
             </div>
-            <h2>{scenario.prompt}</h2>
-            <p className="lesson-instruction">{scenario.recallPrompt}</p>
+            <h2>地図クリックで出発地と到着地を指定</h2>
             <div className="trip-points">
               <div>
                 <span>出発</span>
-                <strong>{origin.name}</strong>
-                <small>{origin.area}</small>
+                <strong>{origin ? formatPoint(origin) : '未指定'}</strong>
+                <small>1回目のクリック</small>
               </div>
               <Route size={20} />
               <div>
                 <span>到着</span>
-                <strong>{destination.name}</strong>
-                <small>{destination.area}</small>
+                <strong>{destination ? formatPoint(destination) : '未指定'}</strong>
+                <small>2回目のクリック</small>
               </div>
+            </div>
+            <div className="action-row route-tools">
+              <button type="button" className="ghost-action wide-action" onClick={resetRoute}>
+                <RefreshCw size={18} /> リセット
+              </button>
             </div>
           </section>
 
-          {lessonState === 'selecting' && (
+          {routeRequestState === 'loading' && (
+            <section className="route-detail">
+              <div className="section-title">
+                <h2>ルート計算中</h2>
+                <span><RefreshCw size={14} /> OSRM</span>
+              </div>
+              <p className="lesson-instruction">実道路の候補ルートと道路名ステップを取得しています。</p>
+            </section>
+          )}
+
+          {routeRequestState === 'error' && (
+            <section className="review-panel" aria-label="ルート計算エラー">
+              <div className="section-title">
+                <h2>ルートを取得できません</h2>
+                <span>error</span>
+              </div>
+              <div className="review-needed">
+                <TriangleAlert size={16} />
+                <p>{routeError}</p>
+              </div>
+              <div className="action-row">
+                <button type="button" className="primary-action" onClick={resetRoute}>
+                  <RefreshCw size={18} /> 地点を指定し直す
+                </button>
+              </div>
+            </section>
+          )}
+
+          {routeRequestState === 'ready' && selectedRoute && lessonState === 'selecting' && (
             <>
               <section className="route-selector" aria-label="候補ルート">
                 <div className="section-title">
                   <h2>候補ルート</h2>
-                  <span>{scenario.candidates.length} routes</span>
+                  <span>{routeSession?.candidates.length ?? 0} routes</span>
                 </div>
                 <div className="route-list">
-                  {scenario.candidates.map((route) => {
-                    const risk = routeRisk(route, scenario.timeBand)
+                  {routeSession?.candidates.map((route, index) => {
                     const active = route.id === selectedRoute.id
                     return (
                       <button
@@ -279,14 +336,13 @@ function App() {
                         type="button"
                         className={active ? 'route-option active' : 'route-option'}
                         onClick={() => selectRoute(route)}
-                        disabled={lessonState !== 'selecting'}
                       >
                         <div>
-                          <strong>{route.name}</strong>
-                          <small>{featureNames(route)}</small>
+                          <strong>候補 {index + 1}</strong>
+                          <small>{route.quizFeatureSequence.slice(0, 4).map((hit) => hit.label).join(' / ') || '道路名なし'}</small>
                         </div>
-                        <span><Clock3 size={14} /> {route.minutes[scenario.timeBand]}分</span>
-                        <span className={`risk risk-${riskLabel(risk)}`}>混雑 {riskLabel(risk)}</span>
+                        <span><Clock3 size={14} /> {route.minutes}分</span>
+                        <span className="risk">{distanceLabel(route.distanceMeters)}</span>
                       </button>
                     )
                   })}
@@ -295,28 +351,31 @@ function App() {
 
               <section className="route-detail">
                 <div className="section-title">
-                  <h2>{selectedRoute.name}</h2>
-                  <span>{selectedRoute.style}</span>
+                  <h2>候補ルートの通過名</h2>
+                  <span>{selectedRoute.summaryLabel}</span>
                 </div>
                 <div className="route-stats">
-                  <div><span>所要</span><strong>{selectedRoute.minutes[scenario.timeBand]}分</strong></div>
-                  <div><span>通過</span><strong>{selectedRoute.featureIds.length}箇所</strong></div>
-                  <div><span>快適</span><strong>{selectedRoute.comfort}%</strong></div>
-                  <div><span>混雑</span><strong>{selectedRisk}%</strong></div>
+                  <div><span>所要</span><strong>{selectedRoute.minutes}分</strong></div>
+                  <div><span>距離</span><strong>{distanceLabel(selectedRoute.distanceMeters)}</strong></div>
+                  <div><span>道路</span><strong>{selectedRoute.roadNames.length}</strong></div>
+                  <div><span>橋</span><strong>{selectedRoute.bridgeFeatureIds.length}</strong></div>
                 </div>
-                <div className="pros-cons">
-                  <p><CheckCircle2 size={16} /> {selectedRoute.merit}</p>
-                  <p><TriangleAlert size={16} /> {selectedRoute.demerit}</p>
+                <div className="dynamic-feature-list" aria-label="通過する道路名と橋名">
+                  {selectedRoute.quizFeatureSequence.map((hit, index) => (
+                    <span key={`${hit.label}-${index}`} className={hit.type === 'bridge' ? 'feature-chip bridge-chip' : 'feature-chip'}>
+                      {index + 1}. {hit.label}
+                    </span>
+                  ))}
                 </div>
                 <div className="learning-note">
                   <BrainCircuit size={17} />
-                  <p>{selectedRoute.learningPoint}</p>
+                  <p>地図上の黒線はOSRMで取得した実道路ルートです。右の順番を見てから、ラベルを隠して思い出します。</p>
                 </div>
                 <div className="action-row">
-                  <button type="button" className="primary-action" onClick={startLesson} disabled={lessonState !== 'selecting'}>
-                    <CarFront size={18} /> このルートを覚える
+                  <button type="button" className="primary-action" onClick={startLesson} disabled={!selectedRoute.quizFeatureSequence.length}>
+                    <EyeOff size={18} /> ラベルを隠して覚える
                   </button>
-                  <button type="button" className="ghost-action" onClick={nextLesson} aria-label="次の課題">
+                  <button type="button" className="ghost-action" onClick={resetRoute} aria-label="地点をリセット">
                     <RefreshCw size={18} />
                   </button>
                 </div>
@@ -324,38 +383,38 @@ function App() {
             </>
           )}
 
-          {lessonState === 'recalling' && (
+          {lessonState === 'recalling' && selectedRoute && (
             <section className="recall-panel" aria-label="記憶チェック">
               <div className="section-title">
                 <h2>記憶チェック</h2>
                 <span><EyeOff size={14} /> ラベル非表示</span>
               </div>
-              <p>{scenario.recallPrompt}</p>
+              <p>{routeSession?.recallPrompt ?? '通過した道路名・橋名を順番に選んでください。'}</p>
               <div className="recall-sequence" aria-label="選択した順番">
-                {recalledFeatureIds.length ? (
-                  recalledFeatureIds.map((featureId, index) => (
-                    <button key={`${featureId}-${index}`} type="button" onClick={() => removeRecallFeature(index)}>
-                      <span>{index + 1}</span>{featureName(featureId)}
+                {recalledLabels.length ? (
+                  recalledLabels.map((label, index) => (
+                    <button key={`${label}-${index}`} type="button" onClick={() => removeRecallLabel(index)}>
+                      <span>{index + 1}</span>{label}
                     </button>
                   ))
                 ) : (
                   <div className="recall-empty">地図を思い出しながら、下の候補を順番に選択</div>
                 )}
               </div>
-              <div className="recall-options" aria-label="候補の橋・通り">
-                {recallOptionIds.map((featureId) => (
+              <div className="recall-options" aria-label="候補の道路名・橋名">
+                {recallOptionLabels.map((label) => (
                   <button
-                    key={featureId}
+                    key={label}
                     type="button"
-                    onClick={() => selectRecallFeature(featureId)}
-                    disabled={recalledFeatureIds.includes(featureId)}
+                    onClick={() => selectRecallLabel(label)}
+                    disabled={recalledLabels.includes(label)}
                   >
-                    {featureName(featureId)}
+                    {label}
                   </button>
                 ))}
               </div>
               <div className="action-row">
-                <button type="button" className="primary-action" onClick={submitRecall} disabled={!recalledFeatureIds.length}>
+                <button type="button" className="primary-action" onClick={submitRecall} disabled={!recalledLabels.length}>
                   <ListChecks size={18} /> 答え合わせ
                 </button>
                 <button type="button" className="ghost-action" onClick={resetRecall} aria-label="選択をリセット">
@@ -365,40 +424,43 @@ function App() {
             </section>
           )}
 
-          {(lessonState === 'reviewing' || lessonState === 'transitioning') && latestLesson && (
+          {lessonState === 'reviewing' && latestLesson && (
             <section className="review-panel" aria-label="結果と復習">
               <div className="section-title">
                 <h2>{latestPerfect ? '順番まで正解' : latestOrderWrong ? '順番を確認' : '復習ポイントあり'}</h2>
-                <span>{selectedRouteIsBest ? '判断良好' : '別解あり'}</span>
+                <span>review</span>
               </div>
               <p>
                 {latestPerfect
-                  ? '通った橋・通りを正しい順番で思い出せました。'
+                  ? '通った道路名・橋名を正しい順番で思い出せました。'
                   : latestOrderWrong
-                    ? '通った道は合っています。順番だけもう一度確認しましょう。'
-                    : '抜けた橋・通りを地図上で赤く表示しています。'}
+                    ? '通った名前は合っています。順番だけもう一度確認しましょう。'
+                    : '抜けた道路名・橋名を確認してください。'}
               </p>
               <div className="answer-block">
                 <span>正しい順番</span>
-                <div>{latestLesson.featureIds.map((id, index) => <strong key={id}>{index + 1}. {featureName(id)}</strong>)}</div>
+                <div>{latestLesson.quizFeatureSequence.map((hit, index) => <strong key={`${hit.label}-${index}`}>{index + 1}. {hit.label}</strong>)}</div>
               </div>
               <div className="answer-block">
                 <span>選んだ順番</span>
                 <div>
-                  {latestLesson.recalledFeatureIds.length
-                    ? latestLesson.recalledFeatureIds.map((id, index) => <strong key={`${id}-${index}`}>{index + 1}. {featureName(id)}</strong>)
+                  {latestLesson.recalledLabels.length
+                    ? latestLesson.recalledLabels.map((label, index) => <strong key={`${label}-${index}`}>{index + 1}. {label}</strong>)
                     : <strong>未選択</strong>}
                 </div>
               </div>
               {!latestPerfect && (
                 <div className="review-needed">
                   <TriangleAlert size={16} />
-                  <p>復習: {featureNamesFromIds(weakFeatureIds(latestLesson))}</p>
+                  <p>復習: {weakLabels(latestLesson).join(' / ')}</p>
                 </div>
               )}
               <div className="action-row">
-                <button type="button" className="primary-action" onClick={nextLesson}>
-                  <Navigation size={18} /> 次の課題
+                <button type="button" className="primary-action" onClick={backToRoutes}>
+                  <Navigation size={18} /> ルート選択に戻る
+                </button>
+                <button type="button" className="ghost-action" onClick={resetRoute} aria-label="新しい地点を指定">
+                  <MapPin size={18} />
                 </button>
               </div>
             </section>
@@ -410,8 +472,8 @@ function App() {
         <article>
           <Map size={19} />
           <div>
-            <h2>今回覚える橋・通り</h2>
-            <p>{lessonState === 'recalling' ? '記憶チェック中は地図ラベルを隠しています。' : featureNames(selectedRoute)}</p>
+            <h2>今回覚える道路名・橋名</h2>
+            <p>{lessonState === 'recalling' ? '記憶チェック中は地図ラベルを隠しています。' : answerLabels.join(' / ') || '出発点と到着点を指定してください。'}</p>
           </div>
         </article>
         <article className="learning-log-card">
@@ -423,7 +485,7 @@ function App() {
                 {completedLessons.map((lesson) => (
                   <li key={lesson.id}>
                     <span>{lesson.completedAtLabel}</span>
-                    <strong>{featureNamesFromIds(lesson.featureIds)}</strong>
+                    <strong>{lesson.quizFeatureSequence.map((hit) => hit.label).join(' / ')}</strong>
                     <small className={isLessonPerfect(lesson) ? 'log-good' : 'log-review'}>
                       {isLessonPerfect(lesson) ? '定着' : '復習'}
                     </small>
@@ -439,7 +501,7 @@ function App() {
           <TriangleAlert size={19} />
           <div>
             <h2>復習が必要な道</h2>
-            <p>{reviewFeatureIds.length ? featureNamesFromIds(reviewFeatureIds) : '今のところ復習対象はありません。'}</p>
+            <p>{reviewLabels.length ? reviewLabels.join(' / ') : '今のところ復習対象はありません。'}</p>
           </div>
         </article>
       </section>

@@ -3,39 +3,102 @@ import { KeyRound, MapPinned } from 'lucide-react'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import { useEffect, useMemo } from 'react'
-import { MapContainer, Marker, Polyline, TileLayer, Tooltip, useMap as useLeafletMap } from 'react-leaflet'
-import {
-  center,
-  type CompletedLesson,
-  type LatLng,
-  type PickupPoint,
-  type RoadFeature,
-  type RouteCandidate,
-  type TimeBand,
-} from '../data/kumamoto'
+import { CircleMarker, MapContainer, Marker, Polygon, Polyline, TileLayer, Tooltip, useMap as useLeafletMap, useMapEvents } from 'react-leaflet'
+import { center, type LatLng, type RoadFeature } from '../data/kumamoto'
+import type { DynamicRouteCandidate, RouteFeatureHit } from '../lib/routing'
 
-type LessonState = 'selecting' | 'recalling' | 'reviewing' | 'transitioning'
+type LessonState = 'selecting' | 'recalling' | 'reviewing'
+type RouteRequestState = 'idle' | 'loading' | 'ready' | 'error'
+
+type CompletedDynamicLesson = {
+  id: string
+  origin: LatLng
+  destination: LatLng
+  selectedRoute: DynamicRouteCandidate
+  quizFeatureSequence: RouteFeatureHit[]
+  recalledLabels: string[]
+  missedLabels: string[]
+  completedAtLabel: string
+}
 
 type Props = {
   features: RoadFeature[]
-  routeCandidates: RouteCandidate[]
-  selectedRoute: RouteCandidate
-  origin: PickupPoint
-  destination: PickupPoint
-  timeBand: TimeBand
-  trafficEnabled: boolean
+  origin: LatLng | null
+  destination: LatLng | null
+  candidates: DynamicRouteCandidate[]
+  selectedRoute: DynamicRouteCandidate | undefined
   lessonState: LessonState
-  completedLessons: CompletedLesson[]
+  routeRequestState: RouteRequestState
+  completedLessons: CompletedDynamicLesson[]
+  onMapClick: (point: LatLng) => void
 }
 
-const emptyCompletedLessons: CompletedLesson[] = []
+const emptyCompletedLessons: CompletedDynamicLesson[] = []
+const redPinHtml = `
+  <div style="
+    width:48px;
+    height:64px;
+    background:#dc2626;
+    border:4px solid #ffffff;
+    clip-path:polygon(50% 100%, 20% 62%, 6% 38%, 8% 16%, 25% 2%, 50% 0, 75% 2%, 92% 16%, 94% 38%, 80% 62%);
+    box-shadow:0 10px 18px rgba(0,0,0,.42);
+    position:relative;
+  ">
+    <div style="
+      position:absolute;
+      left:50%;
+      top:50%;
+      width:18px;
+      height:18px;
+      border-radius:50%;
+      background:#ffffff;
+      border:3px solid #111111;
+      transform:translate(-50%,-50%);
+    "></div>
+  </div>
+`
 
 function latLngBounds(points: LatLng[]) {
   return L.latLngBounds(points.map((point) => [point.lat, point.lng]))
 }
 
-function routePoints(route: RouteCandidate) {
-  return route.routeGeometry
+function routePositions(route: DynamicRouteCandidate) {
+  return route.routeGeometry.map((point) => [point.lat, point.lng] as [number, number])
+}
+
+function getFeatureLabelPoint(feature: RoadFeature) {
+  return feature.labelPoint ?? feature.path[Math.floor(feature.path.length / 2)]
+}
+
+function bridgeHits(route: DynamicRouteCandidate | undefined) {
+  return route?.quizFeatureSequence.filter((hit) => hit.type === 'bridge' && hit.featureId) ?? []
+}
+
+function offsetPoint(point: LatLng, northMeters: number, eastMeters: number): LatLng {
+  const latOffset = northMeters / 111320
+  const lngOffset = eastMeters / (111320 * Math.cos(point.lat * Math.PI / 180))
+  return { lat: point.lat + latOffset, lng: point.lng + lngOffset }
+}
+
+function pinPolygon(point: LatLng): [number, number][] {
+  return [
+    [point.lat, point.lng],
+    [offsetPoint(point, 85, -42).lat, offsetPoint(point, 85, -42).lng],
+    [offsetPoint(point, 145, -36).lat, offsetPoint(point, 145, -36).lng],
+    [offsetPoint(point, 178, 0).lat, offsetPoint(point, 178, 0).lng],
+    [offsetPoint(point, 145, 36).lat, offsetPoint(point, 145, 36).lng],
+    [offsetPoint(point, 85, 42).lat, offsetPoint(point, 85, 42).lng],
+  ]
+}
+
+function ClickHandler({ onMapClick }: { onMapClick: (point: LatLng) => void }) {
+  useMapEvents({
+    click(event) {
+      onMapClick({ lat: event.latlng.lat, lng: event.latlng.lng })
+    },
+  })
+
+  return null
 }
 
 function LeafletFocus({
@@ -43,22 +106,28 @@ function LeafletFocus({
   destination,
   selectedRoute,
 }: {
-  origin: PickupPoint
-  destination: PickupPoint
-  selectedRoute: RouteCandidate
+  origin: LatLng | null
+  destination: LatLng | null
+  selectedRoute: DynamicRouteCandidate | undefined
 }) {
   const map = useLeafletMap()
 
   useEffect(() => {
     const allPoints = [
-      origin.position,
-      destination.position,
-      ...routePoints(selectedRoute),
+      ...(origin ? [origin] : []),
+      ...(destination ? [destination] : []),
+      ...(selectedRoute?.routeGeometry ?? []),
     ]
+    if (!allPoints.length) return
+
     const bounds = latLngBounds(allPoints)
     const focusMap = () => {
       map.invalidateSize()
-      map.fitBounds(bounds, { padding: [96, 96], maxZoom: 14, animate: true })
+      if (allPoints.length === 1) {
+        map.setView([allPoints[0].lat, allPoints[0].lng], 15, { animate: true })
+        return
+      }
+      map.fitBounds(bounds, { padding: [96, 96], maxZoom: 15, animate: true })
     }
 
     focusMap()
@@ -70,53 +139,70 @@ function LeafletFocus({
   return null
 }
 
+function GoogleClickBridge({ onMapClick }: { onMapClick: (point: LatLng) => void }) {
+  const map = useMap()
+
+  useEffect(() => {
+    if (!map) return undefined
+    const listener = map.addListener('click', (event: google.maps.MapMouseEvent) => {
+      const latLng = event.latLng
+      if (!latLng) return
+      onMapClick({ lat: latLng.lat(), lng: latLng.lng() })
+    })
+
+    return () => listener.remove()
+  }, [map, onMapClick])
+
+  return null
+}
+
 function GoogleMapOverlays({
   features,
   selectedRoute,
+  candidates,
   origin,
   destination,
-  trafficEnabled,
   lessonState,
   completedLessons,
+  onMapClick,
 }: Props) {
   const map = useMap()
   const completedLessonHistory = completedLessons ?? emptyCompletedLessons
-  const reviewLesson = lessonState === 'reviewing' || lessonState === 'transitioning'
-    ? completedLessonHistory[0]
-    : undefined
+  const reviewLesson = lessonState === 'reviewing' ? completedLessonHistory[0] : undefined
 
   useEffect(() => {
-    if (!map || !window.google) return
+    if (!map || !window.google) return undefined
 
-    const historyPolylines = completedLessonHistory.flatMap((lesson, index) =>
-      [lesson.selectedRoute.routeGeometry].map((geometry) => new google.maps.Polyline({
-        path: geometry,
+    const historyPolylines = completedLessonHistory.map((lesson, index) => new google.maps.Polyline({
+      path: lesson.selectedRoute.routeGeometry,
+      map,
+      geodesic: true,
+      strokeColor: '#000000',
+      strokeOpacity: Math.max(0.1, 0.24 - index * 0.03),
+      strokeWeight: 2,
+      zIndex: 6,
+    }))
+
+    const candidatePolylines = candidates.map((route) => {
+      const active = route.id === selectedRoute?.id
+      return new google.maps.Polyline({
+        path: route.routeGeometry,
         map,
         geodesic: true,
         strokeColor: '#000000',
-        strokeOpacity: Math.max(0.12, 0.28 - index * 0.03),
-        strokeWeight: 2,
-        zIndex: 6,
-      })),
-    )
-
-    const selectedRoutePolyline = new google.maps.Polyline({
-        path: selectedRoute.routeGeometry,
-        map,
-        geodesic: true,
-        strokeColor: '#000000',
-        strokeOpacity: 0.9,
-        strokeWeight: 8,
-        zIndex: 30,
+        strokeOpacity: active ? 0.9 : 0.24,
+        strokeWeight: active ? 8 : 3,
+        zIndex: active ? 30 : 12,
+      })
     })
 
-    const missedFeatureIds = new Set(reviewLesson?.missedFeatureIds ?? [])
+    const missedLabels = new Set(reviewLesson?.missedLabels ?? [])
     const reviewPolylines = reviewLesson
-      ? selectedRoute.featureIds
-        .map((id) => {
-          const feature = features.find((item) => item.id === id)
+      ? bridgeHits(selectedRoute)
+        .map((hit) => {
+          const feature = features.find((item) => item.id === hit.featureId)
           if (!feature) return undefined
-          const missed = missedFeatureIds.has(id)
+          const missed = missedLabels.has(hit.label)
           return new google.maps.Polyline({
             path: feature.path,
             map,
@@ -131,50 +217,46 @@ function GoogleMapOverlays({
       : []
 
     const markers = [
-      new google.maps.Marker({ position: origin.position, map, label: '発', title: origin.name }),
-      new google.maps.Marker({ position: destination.position, map, label: '着', title: destination.name }),
-    ]
+      origin ? new google.maps.Marker({ position: origin, map, label: '発', title: '出発' }) : undefined,
+      destination ? new google.maps.Marker({ position: destination, map, label: '着', title: '到着' }) : undefined,
+    ].filter(Boolean) as google.maps.Marker[]
 
     const bounds = new google.maps.LatLngBounds()
-    routePoints(selectedRoute).forEach((point) => bounds.extend(point))
-    bounds.extend(origin.position)
-    bounds.extend(destination.position)
-    map.fitBounds(bounds, 80)
+    const focusPoints = [
+      ...(origin ? [origin] : []),
+      ...(destination ? [destination] : []),
+      ...(selectedRoute?.routeGeometry ?? []),
+    ]
+    focusPoints.forEach((point) => bounds.extend(point))
+    if (focusPoints.length > 1) map.fitBounds(bounds, 80)
+    if (focusPoints.length === 1) map.setCenter(focusPoints[0])
 
     return () => {
       historyPolylines.forEach((polyline) => polyline.setMap(null))
-      selectedRoutePolyline.setMap(null)
+      candidatePolylines.forEach((polyline) => polyline.setMap(null))
       reviewPolylines.forEach((polyline) => polyline.setMap(null))
       markers.forEach((marker) => marker.setMap(null))
     }
-  }, [completedLessonHistory, destination, features, map, origin, reviewLesson, selectedRoute])
+  }, [candidates, completedLessonHistory, destination, features, map, origin, reviewLesson, selectedRoute])
 
-  useEffect(() => {
-    if (!map || !window.google || !trafficEnabled) return
-    const layer = new google.maps.TrafficLayer()
-    layer.setMap(map)
-    return () => layer.setMap(null)
-  }, [map, trafficEnabled])
-
-  return null
+  return <GoogleClickBridge onMapClick={onMapClick} />
 }
 
-function OpenStreetMapPanel(props: Omit<Props, 'trafficEnabled'>) {
-  const { features, selectedRoute, origin, destination, lessonState, completedLessons } = props
+function OpenStreetMapPanel(props: Omit<Props, 'routeRequestState'>) {
+  const { features, selectedRoute, candidates, origin, destination, lessonState, completedLessons, onMapClick } = props
   const completedLessonHistory = completedLessons ?? emptyCompletedLessons
-  const reviewLesson = lessonState === 'reviewing' || lessonState === 'transitioning'
-    ? completedLessonHistory[0]
-    : undefined
-  const missedFeatureIds = new Set(reviewLesson?.missedFeatureIds ?? [])
+  const reviewLesson = lessonState === 'reviewing' ? completedLessonHistory[0] : undefined
+  const missedLabels = new Set(reviewLesson?.missedLabels ?? [])
   const showRouteLabels = lessonState !== 'recalling'
 
   const originIcon = useMemo(
     () =>
       L.divIcon({
-        className: 'ride-pin ride-pin-origin',
-        html: '<span>出発</span>',
-        iconSize: [56, 56],
-        iconAnchor: [28, 10],
+        className: 'map-red-pin-wrapper map-red-pin-origin',
+        html: redPinHtml,
+        iconSize: [72, 82],
+        iconAnchor: [27, 66],
+        tooltipAnchor: [0, -72],
       }),
     [],
   )
@@ -182,10 +264,11 @@ function OpenStreetMapPanel(props: Omit<Props, 'trafficEnabled'>) {
   const destinationIcon = useMemo(
     () =>
       L.divIcon({
-        className: 'ride-pin ride-pin-destination',
-        html: '<span>到着</span>',
-        iconSize: [56, 56],
-        iconAnchor: [28, 10],
+        className: 'map-red-pin-wrapper map-red-pin-destination',
+        html: redPinHtml,
+        iconSize: [72, 82],
+        iconAnchor: [27, 66],
+        tooltipAnchor: [0, -72],
       }),
     [],
   )
@@ -207,40 +290,45 @@ function OpenStreetMapPanel(props: Omit<Props, 'trafficEnabled'>) {
         maxZoom={19}
       />
 
+      <ClickHandler onMapClick={onMapClick} />
+
       {completedLessonHistory.map((lesson, index) => (
-        [lesson.selectedRoute.routeGeometry].map((geometry) => (
+        <Polyline
+          key={`${lesson.id}-history`}
+          positions={routePositions(lesson.selectedRoute)}
+          pathOptions={{
+            color: '#000000',
+            opacity: Math.max(0.1, 0.24 - index * 0.03),
+            weight: 2,
+            lineCap: 'round',
+            lineJoin: 'round',
+          }}
+          className="learning-segment-history"
+        />
+      ))}
+
+      {candidates.map((route) => {
+        const active = route.id === selectedRoute?.id
+        return (
           <Polyline
-            key={`${lesson.id}-history`}
-            positions={geometry.map((point) => [point.lat, point.lng])}
+            key={route.id}
+            positions={routePositions(route)}
             pathOptions={{
               color: '#000000',
-              opacity: Math.max(0.12, 0.3 - index * 0.035),
-              weight: 2,
+              opacity: active ? 0.9 : 0.24,
+              weight: active ? 8 : 3,
               lineCap: 'round',
               lineJoin: 'round',
             }}
-            className="learning-segment-history"
+            className={active ? 'learning-segment-active' : 'learning-segment-muted'}
           />
-        ))
-      ))}
+        )
+      })}
 
-      <Polyline
-        key={selectedRoute.id}
-        positions={selectedRoute.routeGeometry.map((point) => [point.lat, point.lng])}
-        pathOptions={{
-          color: '#000000',
-          opacity: 0.9,
-          weight: 8,
-          lineCap: 'round',
-          lineJoin: 'round',
-        }}
-        className="learning-segment-active"
-      />
-
-      {reviewLesson && selectedRoute.featureIds.map((id) => {
-        const feature = features.find((item) => item.id === id)
+      {reviewLesson && bridgeHits(selectedRoute).map((hit) => {
+        const feature = features.find((item) => item.id === hit.featureId)
         if (!feature) return null
-        const missed = missedFeatureIds.has(id)
+        const missed = missedLabels.has(hit.label)
         return (
           <Polyline
             key={`review-${feature.id}-${missed ? 'missed' : 'ok'}`}
@@ -257,22 +345,49 @@ function OpenStreetMapPanel(props: Omit<Props, 'trafficEnabled'>) {
         )
       })}
 
-      {showRouteLabels && (
+      {origin && (
+        <>
+          <Polygon
+            positions={pinPolygon(origin)}
+            pathOptions={{ color: '#ffffff', fillColor: '#dc2626', fillOpacity: 1, opacity: 1, weight: 4 }}
+          />
+          <CircleMarker
+            center={[offsetPoint(origin, 120, 0).lat, offsetPoint(origin, 120, 0).lng]}
+            radius={7}
+            pathOptions={{ color: '#111111', fillColor: '#ffffff', fillOpacity: 1, weight: 2 }}
+          />
+        </>
+      )}
+      {destination && (
+        <>
+          <Polygon
+            positions={pinPolygon(destination)}
+            pathOptions={{ color: '#ffffff', fillColor: '#dc2626', fillOpacity: 1, opacity: 1, weight: 4 }}
+          />
+          <CircleMarker
+            center={[offsetPoint(destination, 120, 0).lat, offsetPoint(destination, 120, 0).lng]}
+            radius={7}
+            pathOptions={{ color: '#111111', fillColor: '#ffffff', fillOpacity: 1, weight: 2 }}
+          />
+        </>
+      )}
+
+      {showRouteLabels && selectedRoute && (
         <Marker
-          position={[selectedRoute.routeGeometry[0]?.lat ?? origin.position.lat, selectedRoute.routeGeometry[0]?.lng ?? origin.position.lng]}
+          position={[selectedRoute.routeGeometry[0]?.lat ?? origin?.lat ?? center.lat, selectedRoute.routeGeometry[0]?.lng ?? origin?.lng ?? center.lng]}
           icon={L.divIcon({
             className: 'route-name-pin',
-            html: `<span>${selectedRoute.name}</span>`,
+            html: `<span>${selectedRoute.summaryLabel}</span>`,
             iconSize: [180, 32],
             iconAnchor: [90, 16],
           })}
         />
       )}
 
-      {showRouteLabels && selectedRoute.featureIds.map((id) => {
-        const feature = features.find((item) => item.id === id)
+      {showRouteLabels && bridgeHits(selectedRoute).map((hit) => {
+        const feature = features.find((item) => item.id === hit.featureId)
         if (!feature) return null
-        const labelPoint = feature.labelPoint ?? feature.path[Math.floor(feature.path.length / 2)]
+        const labelPoint = getFeatureLabelPoint(feature)
         return (
           <Marker
             key={feature.id}
@@ -287,16 +402,20 @@ function OpenStreetMapPanel(props: Omit<Props, 'trafficEnabled'>) {
         )
       })}
 
-      <Marker position={[origin.position.lat, origin.position.lng]} icon={originIcon}>
-        <Tooltip direction="top" offset={[0, -12]} opacity={0.95}>
-          {origin.name}
-        </Tooltip>
-      </Marker>
-      <Marker position={[destination.position.lat, destination.position.lng]} icon={destinationIcon}>
-        <Tooltip direction="top" offset={[0, -12]} opacity={0.95}>
-          {destination.name}
-        </Tooltip>
-      </Marker>
+      {origin && (
+        <Marker position={[origin.lat, origin.lng]} icon={originIcon} zIndexOffset={5000}>
+          <Tooltip direction="top" offset={[0, -72]} opacity={0.98} className="point-tooltip">
+            出発
+          </Tooltip>
+        </Marker>
+      )}
+      {destination && (
+        <Marker position={[destination.lat, destination.lng]} icon={destinationIcon} zIndexOffset={5010}>
+          <Tooltip direction="top" offset={[0, -72]} opacity={0.98} className="point-tooltip">
+            到着
+          </Tooltip>
+        </Marker>
+      )}
       <LeafletFocus origin={origin} destination={destination} selectedRoute={selectedRoute} />
     </MapContainer>
   )
@@ -309,7 +428,7 @@ export function GoogleMapPanel(props: Props) {
     <section className="map-surface" aria-label="熊本市内の道覚えマップ">
       <div className="map-status">
         <span><KeyRound size={15} /> {apiKey ? 'Google Maps API 接続' : 'OpenStreetMap 表示'}</span>
-        {!apiKey && <span><MapPinned size={15} /> APIキーなしで学習ルートを表示</span>}
+        {!apiKey && <span><MapPinned size={15} /> 地図クリックで地点指定</span>}
       </div>
       {apiKey ? (
         <APIProvider apiKey={apiKey} language="ja" region="JP">
@@ -328,17 +447,17 @@ export function GoogleMapPanel(props: Props) {
       ) : (
         <OpenStreetMapPanel
           features={props.features}
-          routeCandidates={props.routeCandidates}
-          selectedRoute={props.selectedRoute}
           origin={props.origin}
           destination={props.destination}
-          timeBand={props.timeBand}
+          candidates={props.candidates}
+          selectedRoute={props.selectedRoute}
           lessonState={props.lessonState}
           completedLessons={props.completedLessons}
+          onMapClick={props.onMapClick}
         />
       )}
-      <div className={props.lessonState === 'transitioning' ? 'map-wipe active' : 'map-wipe'} aria-hidden="true">
-        <span>NEXT LESSON</span>
+      <div className={props.routeRequestState === 'loading' ? 'map-wipe active' : 'map-wipe'} aria-hidden="true">
+        <span>ROUTING</span>
       </div>
     </section>
   )
