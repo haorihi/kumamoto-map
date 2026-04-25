@@ -34,6 +34,13 @@ type OsrmStep = {
   }
 }
 
+type RouteBounds = {
+  minLat: number
+  maxLat: number
+  minLng: number
+  maxLng: number
+}
+
 type OsrmRoute = {
   distance: number
   duration: number
@@ -59,6 +66,7 @@ const KUMAMOTO_BOUNDS = {
 }
 
 const BRIDGE_MATCH_THRESHOLD_METERS = 45
+const MAX_QUIZ_ROAD_NAMES = 18
 
 export function isWithinKumamotoTrainingArea(point: LatLng) {
   return (
@@ -121,9 +129,10 @@ export async function fetchRouteSession(
 function normalizeRouteCandidate(route: OsrmRoute, index: number, features: RoadFeature[]): DynamicRouteCandidate {
   const routeGeometry = coordinatesToLatLng(route.geometry?.coordinates ?? [])
   const steps = route.legs?.flatMap((leg) => leg.steps ?? []) ?? []
-  const roadNames = normalizeRoadNames(steps.map((step) => step.name))
+  const roadHits = normalizeRoadHits(steps, routeGeometry)
+  const roadNames = roadHits.map((hit) => hit.label)
   const bridgeHits = findBridgeHits(routeGeometry, features)
-  const quizFeatureSequence = buildQuizSequence(roadNames, bridgeHits)
+  const quizFeatureSequence = buildQuizSequence(roadHits, bridgeHits)
   const minutes = Math.max(1, Math.round(route.duration / 60))
   const distanceKm = route.distance / 1000
 
@@ -139,32 +148,32 @@ function normalizeRouteCandidate(route: OsrmRoute, index: number, features: Road
   }
 }
 
-function normalizeRoadNames(names: Array<string | undefined>) {
-  const normalized: string[] = []
-  for (const name of names) {
-    const candidates = (name ?? '')
+function normalizeRoadHits(steps: OsrmStep[], routeGeometry: LatLng[]) {
+  const allHits: RouteFeatureHit[] = []
+
+  steps.forEach((step, stepIndex) => {
+    const labels = (step.name ?? '')
       .split(',')
       .map((part) => part.trim())
       .filter((part) => part.length >= 2 && !/^unnamed/i.test(part))
 
-    for (const candidate of candidates) {
-      if (normalized[normalized.length - 1] !== candidate) {
-        normalized.push(candidate)
+    const order = resolveStepOrder(step, stepIndex, steps.length, routeGeometry)
+    for (const label of labels) {
+      if (allHits[allHits.length - 1]?.label !== label) {
+        allHits.push({
+          type: 'road',
+          label,
+          source: 'osrm-step',
+          order,
+        })
       }
     }
-  }
+  })
 
-  return normalized.slice(0, 18)
+  return pickRepresentativeRouteHits(allHits, MAX_QUIZ_ROAD_NAMES)
 }
 
-function buildQuizSequence(roadNames: string[], bridgeHits: RouteFeatureHit[]) {
-  const roadHits: RouteFeatureHit[] = roadNames.map((label, index) => ({
-    type: 'road',
-    label,
-    source: 'osrm-step',
-    order: index * 10,
-  }))
-
+function buildQuizSequence(roadHits: RouteFeatureHit[], bridgeHits: RouteFeatureHit[]) {
   const merged = [...roadHits, ...bridgeHits]
     .sort((a, b) => a.order - b.order)
     .filter((hit, index, hits) => index === 0 || hits[index - 1].label !== hit.label)
@@ -173,8 +182,11 @@ function buildQuizSequence(roadNames: string[], bridgeHits: RouteFeatureHit[]) {
 }
 
 function findBridgeHits(routeGeometry: LatLng[], features: RoadFeature[]): RouteFeatureHit[] {
+  const routeBounds = expandBounds(toBounds(routeGeometry), metersToCoordinateDegrees(BRIDGE_MATCH_THRESHOLD_METERS))
+
   return features
     .filter((feature) => feature.category === 'bridge')
+    .filter((feature) => boundsOverlap(routeBounds, toBounds(feature.path)))
     .map((feature) => {
       const match = nearestRouteMatch(routeGeometry, feature.path)
       return {
@@ -197,8 +209,15 @@ function findBridgeHits(routeGeometry: LatLng[], features: RoadFeature[]): Route
 function nearestRouteMatch(routeGeometry: LatLng[], featurePath: LatLng[]) {
   let bestDistance = Number.POSITIVE_INFINITY
   let bestIndex = 0
+  const featureBounds = expandBounds(toBounds(featurePath), metersToCoordinateDegrees(BRIDGE_MATCH_THRESHOLD_METERS))
+  const candidateRoutePoints = routeGeometry
+    .map((point, index) => ({ point, index }))
+    .filter(({ point }) => isInsideBounds(point, featureBounds))
+  const routePoints = candidateRoutePoints.length
+    ? candidateRoutePoints
+    : routeGeometry.map((point, index) => ({ point, index }))
 
-  routeGeometry.forEach((routePoint, index) => {
+  routePoints.forEach(({ point: routePoint, index }) => {
     for (const featurePoint of featurePath) {
       const distance = distanceMeters(routePoint, featurePoint)
       if (distance < bestDistance) {
@@ -209,6 +228,67 @@ function nearestRouteMatch(routeGeometry: LatLng[], featurePath: LatLng[]) {
   })
 
   return { distance: bestDistance, index: bestIndex }
+}
+
+function resolveStepOrder(step: OsrmStep, stepIndex: number, stepCount: number, routeGeometry: LatLng[]) {
+  const stepGeometry = coordinatesToLatLng(step.geometry?.coordinates ?? [])
+  const firstStepPoint = stepGeometry[0]
+  if (firstStepPoint && routeGeometry.length) {
+    return nearestRouteMatch(routeGeometry, [firstStepPoint]).index * 10
+  }
+
+  const fallbackIndex = stepCount <= 1
+    ? 0
+    : Math.round((stepIndex / (stepCount - 1)) * Math.max(0, routeGeometry.length - 1))
+  return fallbackIndex * 10
+}
+
+function pickRepresentativeRouteHits(hits: RouteFeatureHit[], maxCount: number) {
+  if (hits.length <= maxCount) {
+    return hits
+  }
+
+  const selectedIndexes = new Set<number>()
+  for (let slot = 0; slot < maxCount; slot += 1) {
+    selectedIndexes.add(Math.round((slot * (hits.length - 1)) / (maxCount - 1)))
+  }
+
+  return hits.filter((_, index) => selectedIndexes.has(index))
+}
+
+function toBounds(points: LatLng[]): RouteBounds {
+  return points.reduce<RouteBounds>((bounds, point) => ({
+    minLat: Math.min(bounds.minLat, point.lat),
+    maxLat: Math.max(bounds.maxLat, point.lat),
+    minLng: Math.min(bounds.minLng, point.lng),
+    maxLng: Math.max(bounds.maxLng, point.lng),
+  }), {
+    minLat: Number.POSITIVE_INFINITY,
+    maxLat: Number.NEGATIVE_INFINITY,
+    minLng: Number.POSITIVE_INFINITY,
+    maxLng: Number.NEGATIVE_INFINITY,
+  })
+}
+
+function expandBounds(bounds: RouteBounds, coordinateDegrees: number): RouteBounds {
+  return {
+    minLat: bounds.minLat - coordinateDegrees,
+    maxLat: bounds.maxLat + coordinateDegrees,
+    minLng: bounds.minLng - coordinateDegrees,
+    maxLng: bounds.maxLng + coordinateDegrees,
+  }
+}
+
+function boundsOverlap(a: RouteBounds, b: RouteBounds) {
+  return a.minLat <= b.maxLat && a.maxLat >= b.minLat && a.minLng <= b.maxLng && a.maxLng >= b.minLng
+}
+
+function isInsideBounds(point: LatLng, bounds: RouteBounds) {
+  return point.lat >= bounds.minLat && point.lat <= bounds.maxLat && point.lng >= bounds.minLng && point.lng <= bounds.maxLng
+}
+
+function metersToCoordinateDegrees(meters: number) {
+  return meters / 90_000
 }
 
 function coordinatesToLatLng(coordinates: [number, number][]): LatLng[] {
